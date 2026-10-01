@@ -1,0 +1,287 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: '8.7' }
+      - name: Generate Android project around index.html
+        run: |
+          test -f index.html
+          A=android/app/src/main
+          mkdir -p $A/assets $A/java/com/aura/music
+          cp index.html $A/assets/index.html
+          cat > android/settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "AURA-Music"
+          include ':app'
+          EOF
+          cat > android/build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOF
+          cat > android/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF
+          cat > android/app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.aura.music'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.aura.music'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '0.1.0'
+              }
+              compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17; encoding "UTF-8" }
+          }
+          dependencies { implementation 'androidx.appcompat:appcompat:1.7.0' }
+          EOF
+          cat > $A/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <application android:label="AURA Music" android:allowBackup="false"
+                  android:theme="@style/Theme.AppCompat.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".PlaybackService" android:exported="false" android:foregroundServiceType="mediaPlayback"/>
+              </application>
+          </manifest>
+          EOF
+          cat > $A/java/com/aura/music/MainActivity.java <<'EOF'
+          package com.aura.music;
+          
+          import android.Manifest;
+          import android.content.*;
+          import android.os.Build;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.webkit.*;
+          import androidx.appcompat.app.AppCompatActivity;
+          
+          /** Hosts the local web app. No network access, no remote content. */
+          public class MainActivity extends AppCompatActivity {
+              private WebView web;
+              private ValueCallback<Uri[]> chooserCb;
+              private static final int PICK = 7;
+              private final BroadcastReceiver actions = new BroadcastReceiver() {
+                  @Override public void onReceive(Context c, Intent i) {
+                      String a = i.getStringExtra("a");
+                      if (a != null && web != null) web.evaluateJavascript("window.AURA&&AURA.act('" + a.replaceAll("[^a-z]", "") + "')", null);
+                  }
+              };
+              /** Puente JS → nativo: solo informa del estado para la notificación. */
+              private class Bridge {
+                  @JavascriptInterface public void state(String title, String artist, boolean playing, String cover) { PlaybackService.update(MainActivity.this, title, artist, playing, cover); }
+              }
+          
+              @Override protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  web = new WebView(this);
+                  web.setBackgroundColor(Color.BLACK);
+                  setContentView(web);
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setAllowFileAccess(false);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) { return true; }
+                  });
+                  web.setWebChromeClient(new WebChromeClient() {
+                      @Override public boolean onShowFileChooser(WebView w, ValueCallback<Uri[]> cb, FileChooserParams p) {
+                          if (chooserCb != null) chooserCb.onReceiveValue(null);
+                          chooserCb = cb;
+                          Intent i = new Intent(Intent.ACTION_GET_CONTENT).addCategory(Intent.CATEGORY_OPENABLE)
+                              .setType("*/*").putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                              .putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"audio/*", "text/*", "application/json", "application/octet-stream", "application/zip", "application/x-zip-compressed"});
+                          try { startActivityForResult(i, PICK); } catch (Exception e) { chooserCb = null; return false; }
+                          return true;
+                      }
+                  });
+                  web.addJavascriptInterface(new Bridge(), "AuraNative");
+                  IntentFilter f = new IntentFilter(PlaybackService.ACTION);
+                  if (Build.VERSION.SDK_INT >= 33) registerReceiver(actions, f, Context.RECEIVER_NOT_EXPORTED); else registerReceiver(actions, f);
+                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
+                  web.loadUrl("file:///android_asset/index.html");
+              }
+          
+              @Override protected void onActivityResult(int req, int res, Intent d) {
+                  super.onActivityResult(req, res, d);
+                  if (req != PICK || chooserCb == null) return;
+                  Uri[] out = null;
+                  if (res == RESULT_OK && d != null) {
+                      if (d.getClipData() != null) {
+                          out = new Uri[d.getClipData().getItemCount()];
+                          for (int k = 0; k < out.length; k++) out[k] = d.getClipData().getItemAt(k).getUri();
+                      } else if (d.getData() != null) out = new Uri[]{d.getData()};
+                  }
+                  chooserCb.onReceiveValue(out);
+                  chooserCb = null;
+              }
+          
+              @Override public void onBackPressed() {
+                  web.evaluateJavascript("window.AURA&&AURA.back()", v -> { if ("true".equals(v)) return; super.onBackPressed(); });
+              }
+          
+              @Override protected void onDestroy() {
+                  try { unregisterReceiver(actions); } catch (Exception ignored) { }
+                  stopService(new Intent(this, PlaybackService.class));
+                  super.onDestroy();
+              }
+          }
+          EOF
+          cat > $A/java/com/aura/music/PlaybackService.java <<'EOF'
+          package com.aura.music;
+          
+          import android.app.*;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.graphics.drawable.Icon;
+          import android.media.MediaMetadata;
+          import android.media.session.MediaSession;
+          import android.media.session.PlaybackState;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.util.Base64;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          
+          /**
+           * Servicio en primer plano: mantiene viva la reproducción, muestra la notificación multimedia
+           * (con portada) y expone una MediaSession para Bluetooth y pantalla de bloqueo.
+           */
+          public class PlaybackService extends Service {
+              static final String CH = "aura_play", ACTION = "com.aura.music.ACT";
+              private static PlaybackService inst;
+              private final Handler main = new Handler(Looper.getMainLooper());
+              private MediaSession session;
+              private String title = "", artist = "", coverKey = "";
+              private boolean playing;
+              private Bitmap art;
+          
+              public static void update(android.content.Context c, String t, String a, boolean p, String cover) {
+                  final PlaybackService s = inst;
+                  if (s != null) { s.main.post(() -> s.show(t, a, p, cover)); return; }
+                  try { c.startForegroundService(new Intent(c, PlaybackService.class).putExtra("t", t).putExtra("a", a).putExtra("p", p).putExtra("c", cover)); }
+                  catch (Exception ignored) { }
+              }
+          
+              @Override public void onCreate() {
+                  super.onCreate();
+                  inst = this;
+                  session = new MediaSession(this, "AURA");
+                  session.setCallback(new MediaSession.Callback() {
+                      @Override public void onPlay() { send("toggle"); }
+                      @Override public void onPause() { send("toggle"); }
+                      @Override public void onSkipToNext() { send("next"); }
+                      @Override public void onSkipToPrevious() { send("prev"); }
+                  });
+                  session.setActive(true);
+              }
+          
+              @Override public int onStartCommand(Intent i, int f, int id) {
+                  if (i == null) { stopSelf(); return START_NOT_STICKY; }
+                  show(i.getStringExtra("t"), i.getStringExtra("a"), i.getBooleanExtra("p", false), i.getStringExtra("c"));
+                  return START_NOT_STICKY;
+              }
+          
+              private void send(String key) { sendBroadcast(new Intent(ACTION).setPackage(getPackageName()).putExtra("a", key)); }
+          
+              private Notification.Action act(String name, int icon, String key) {
+                  PendingIntent pi = PendingIntent.getBroadcast(this, key.hashCode(),
+                      new Intent(ACTION).setPackage(getPackageName()).putExtra("a", key), PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                  return new Notification.Action.Builder(Icon.createWithResource(this, icon), name, pi).build();
+              }
+          
+              void show(String t, String a, boolean p, String cover) {
+                  title = t == null ? "" : t; artist = a == null ? "" : a; playing = p;
+                  if (cover != null && !cover.equals(coverKey)) { coverKey = cover; art = null; loadCover(cover); }
+                  render();
+              }
+          
+              /** Carga la portada (data: local o https) fuera del hilo principal. */
+              private void loadCover(final String src) {
+                  new Thread(() -> {
+                      Bitmap b = null;
+                      try {
+                          if (src.startsWith("data:")) {
+                              byte[] d = Base64.decode(src.substring(src.indexOf(',') + 1), Base64.DEFAULT);
+                              b = BitmapFactory.decodeByteArray(d, 0, d.length);
+                          } else if (src.startsWith("https://")) {
+                              HttpURLConnection con = (HttpURLConnection) new URL(src).openConnection();
+                              con.setConnectTimeout(8000); con.setReadTimeout(8000);
+                              b = BitmapFactory.decodeStream(con.getInputStream());
+                              con.disconnect();
+                          }
+                      } catch (Exception ignored) { }
+                      final Bitmap fb = b;
+                      main.post(() -> { if (src.equals(coverKey)) { art = fb; render(); } });
+                  }).start();
+              }
+          
+              private void render() {
+                  NotificationManager nm = getSystemService(NotificationManager.class);
+                  nm.createNotificationChannel(new NotificationChannel(CH, "Reproducción", NotificationManager.IMPORTANCE_LOW));
+                  MediaMetadata.Builder md = new MediaMetadata.Builder()
+                      .putString(MediaMetadata.METADATA_KEY_TITLE, title).putString(MediaMetadata.METADATA_KEY_ARTIST, artist);
+                  if (art != null) md.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, art);
+                  session.setMetadata(md.build());
+                  session.setPlaybackState(new PlaybackState.Builder()
+                      .setActions(PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE | PlaybackState.ACTION_PLAY_PAUSE
+                          | PlaybackState.ACTION_SKIP_TO_NEXT | PlaybackState.ACTION_SKIP_TO_PREVIOUS)
+                      .setState(playing ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED, PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1f).build());
+                  PendingIntent open = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
+                  Notification.Builder nb = new Notification.Builder(this, CH)
+                      .setSmallIcon(android.R.drawable.ic_media_play).setContentTitle(title).setContentText(artist)
+                      .setContentIntent(open).setOngoing(playing).setVisibility(Notification.VISIBILITY_PUBLIC)
+                      .addAction(act("Anterior", android.R.drawable.ic_media_previous, "prev"))
+                      .addAction(act(playing ? "Pausa" : "Reproducir", playing ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play, "toggle"))
+                      .addAction(act("Siguiente", android.R.drawable.ic_media_next, "next"))
+                      .setStyle(new Notification.MediaStyle().setMediaSession(session.getSessionToken()).setShowActionsInCompactView(0, 1, 2));
+                  if (art != null) nb.setLargeIcon(art);
+                  Notification n = nb.build();
+                  if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+                  else startForeground(1, n);
+              }
+          
+              @Override public void onDestroy() { inst = null; if (session != null) session.release(); super.onDestroy(); }
+              @Override public IBinder onBind(Intent i) { return null; }
+          }
+          EOF
+      - name: Build debug APK
+        working-directory: android
+        run: gradle assembleDebug --no-daemon
+      - name: Verify APK
+        run: |
+          f=$(find android/app/build/outputs/apk/debug -name '*.apk' | head -n1)
+          test -f "$f"
+          cp "$f" AURA-Music-debug.apk
+      - uses: actions/upload-artifact@v4
+        with: { name: AURA-Music-debug, path: AURA-Music-debug.apk }
+
